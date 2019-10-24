@@ -1,0 +1,82 @@
+BUMP = params.BUMP ? params.BUMP : "patch"
+ORIGIN_BRANCH = "origin/jenkins_test"
+
+def to_version = [:]
+to_version["main"] = true
+node("tooling") {  // Run only on a release-labelled node
+  try {
+    environment { 
+      PACKER= "packer-1.4.3"
+      Build_dir="aws-ec2-rhel7"
+    }
+    stage('preparation'){ 
+      sh 'echo "Starting Pulling Code"'
+      checkout([$class: 'GitSCM', branches: [[name: '*/jenkins_test']], doGenerateSubmoduleConfigurations: false, extensions: [[$class: 'CleanBeforeCheckout'], [$class: 'AuthorInChangelog']], submoduleCfg: [], userRemoteConfigs: [[credentialsId: 'gitlab-ssh',  url: 'git@gitlab.ce.com.sss.int:cloud-engineering/packer/golden-images-linux.git']]])
+      updateGitlabCommitStatus name: 'build', state: 'success'
+      slack.send "Code Pulled Succesfully"     // Notify slack
+      currentBuild.result = 'SUCCESS'  
+    } 
+    stage("Run Commands in Parallel") {
+      parallel(
+        "run first Command": {
+          echo "hello"
+
+        },
+        "run second command": {
+        echo "start job"
+        echo "aws-ec2-rhel7"
+          dir("aws-ec2-rhel7") {
+            // Detect all changed files against the source branch
+            def changed_files = sh(returnStdout: true, script: "git diff ${ORIGIN_BRANCH} --name-only").trim().tokenize('\n')
+            // Iterate the changed files to determine which versions we need to change
+            for (i=0; i<changed_files.size(); i++) {
+              def filename = changed_files[i]
+              switch(filename) {
+                case ~/.VERSION./:  // Ignore manual version file changes
+                break
+                sh 'cat VERSION'
+                sh 'pwd'        
+              }
+            }
+            // Begin the commit message and init the version var
+            def commit = "ci: bumping version file(s)\n"
+            def version
+            // Iterate each of the items to version
+            // For each, update the commit message after incrementing the version, add a tag and stage the VERSION file
+            to_version.each { folder, to_bump ->
+              if (to_bump && folder == "main") {
+                commit += "\n  "
+                commit += sh(returnStdout: true, script: "${JENKINS_HOME}/.local/bin/bump-version ${BUMP}").trim()
+                commit += " (main)"
+                version = sh(returnStdout: true, script: "cat VERSION").trim()
+                sh "git add VERSION"
+                sh "cat VERSION"
+                sh "pwd"
+              } else if (to_bump) {
+                dir(folder) {
+                  commit += "\n  "
+                  commit += sh(returnStdout: true, script: "${JENKINS_HOME}/.local/bin/bump-version ${BUMP}").trim()
+                  commit += " (${folder})"
+                  version = sh(returnStdout: true, script: "cat VERSION").trim()
+                  sh "git add VERSION"
+                  
+                }
+              }
+            }
+            sh "pwd"
+            sh "packer build -var build_version=\$(head -1 VERSION) packer.json"
+          }    
+        }
+      )
+    }
+  }
+   catch (Exception e) {
+    slack.send "failure detected:\n\n${commit}", null, "red"
+    currentBuild.result = "FAILURE"
+    updateGitlabCommitStatus(name: 'build', state: 'failed')
+    addGitLabMRComment comment: "Something unexpected happened. Inspect Jenkins logs."
+    throw e
+  } finally {  // Always cleanup
+    cleanWs()
+  }
+}
